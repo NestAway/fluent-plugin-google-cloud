@@ -87,7 +87,7 @@ module Fluent
       }.freeze
       EC2_CONSTANTS = {
         service: 'ec2.amazonaws.com',
-        resource_type: 'aws_ec2_instance'
+        resource_type: 'project'
       }.freeze
       ML_CONSTANTS = {
         service: 'ml.googleapis.com',
@@ -975,6 +975,7 @@ module Fluent
         }
         labels['aws_account'] = ec2_metadata['accountId'] if
           ec2_metadata.key?('accountId')
+        labels['project_id'] = 'k8s_cluster_logs'
         return labels
       end
 
