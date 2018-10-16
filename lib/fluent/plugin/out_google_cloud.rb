@@ -86,7 +86,7 @@ module Fluent
         resource_type: 'container',
         extra_resource_labels: %w(namespace_id pod_id container_name),
         extra_common_labels: %w(namespace_name pod_name),
-        metadata_attributes: %w(kube-env),
+        metadata_attributes: %w(cluster-name cluster-location),
         stream_severity_map: {
           'stdout' => 'INFO',
           'stderr' => 'ERROR'
@@ -165,6 +165,11 @@ module Fluent
       # monitored resource from Stackdriver Metadata agent.
       LOCAL_RESOURCE_ID_KEY = 'logging.googleapis.com/local_resource_id'.freeze
 
+      # The regexp matches stackdriver trace id format: 32-byte hex string.
+      # The format is documented in
+      # https://cloud.google.com/trace/docs/reference/v2/rpc/google.devtools.cloudtrace.v1#trace
+      STACKDRIVER_TRACE_ID_REGEXP = Regexp.new('^\h{32}$').freeze
+
       # Map from each field name under LogEntry to corresponding variables
       # required to perform field value extraction from the log record.
       LOG_ENTRY_FIELDS_MAP = {
@@ -228,15 +233,23 @@ module Fluent
     Fluent::Plugin.register_output('google_cloud', self)
 
     PLUGIN_NAME = 'Fluentd Google Cloud Logging plugin'.freeze
-    # Extract plugin version by finding the spec this file was loaded from.
+
     PLUGIN_VERSION = begin
-      dependency = Gem::Dependency.new('fluent-plugin-google-cloud')
-      all_specs, = Gem::SpecFetcher.fetcher.spec_for_dependency(dependency)
-      matching_spec, = all_specs.grep(
-        proc { |spec,| __FILE__.include?(spec.full_gem_path) }) do |spec,|
-          spec.version.to_s
-        end
-      matching_spec
+      # Extract plugin version from file path.
+      match_data = __FILE__.match(
+        %r{fluent-plugin-google-cloud-(?<version>[0-9a-zA-Z\.]*)/})
+      if match_data
+        match_data['version']
+      else
+        # Extract plugin version by finding the spec this file was loaded from.
+        dependency = Gem::Dependency.new('fluent-plugin-google-cloud')
+        all_specs, = Gem::SpecFetcher.fetcher.spec_for_dependency(dependency)
+        matching_version, = all_specs.grep(
+          proc { |spec,| __FILE__.include?(spec.full_gem_path) }) do |spec,|
+            spec.version.to_s
+          end
+        matching_version
+      end
     end.freeze
 
     # Name of the the Google cloud logging write scope.
@@ -410,6 +423,12 @@ module Fluent
     # Whether to attempt adjusting invalid log entry timestamps.
     config_param :adjust_invalid_timestamps, :bool, :default => true
 
+    # Whether to autoformat value of "logging.googleapis.com/trace" to
+    # comply with Stackdriver Trace format
+    # "projects/[PROJECT-ID]/traces/[TRACE-ID]" when setting
+    # LogEntry.trace.
+    config_param :autoformat_stackdriver_trace, :bool, :default => true
+
     # rubocop:enable Style/HashSyntax
 
     # TODO: Add a log_name config option rather than just using the tag?
@@ -550,10 +569,12 @@ module Fluent
         @write_request = method(:write_request_via_rest)
       end
 
-      # Log an informational message containing the Logs viewer URL
-      @log.info 'Logs viewer address: https://console.cloud.google.com/logs/',
-                "viewer?project=#{@project_id}&resource=#{@resource.type}/",
-                "instance_id/#{@vm_id}"
+      if [Platform::GCE, Platform::EC2].include?(@platform)
+        # Log an informational message containing the Logs viewer URL
+        @log.info 'Logs viewer address: https://console.cloud.google.com/logs/',
+                  "viewer?project=#{@project_id}&resource=#{@resource.type}/",
+                  "instance_id/#{@vm_id}"
+      end
     end
 
     def start
@@ -625,7 +646,8 @@ module Fluent
                                             ts_nanos)
 
           trace = record.delete(@trace_key)
-          entry.trace = trace if trace
+          entry.trace = compute_trace(trace) if trace
+
           span_id = record.delete(@span_id_key)
           entry.span_id = span_id if span_id
           insert_id = record.delete(@insert_id_key)
@@ -673,6 +695,12 @@ module Fluent
     end
 
     private
+
+    def compute_trace(trace)
+      return trace unless @autoformat_stackdriver_trace &&
+                          STACKDRIVER_TRACE_ID_REGEXP.match(trace)
+      "projects/#{@project_id}/traces/#{trace}"
+    end
 
     def construct_log_entry_in_grpc_format(labels,
                                            resource,
@@ -1027,8 +1055,10 @@ module Fluent
       # All metadata parameters must now be set.
       missing = []
       missing << 'project_id' unless @project_id
-      missing << 'zone' unless @zone
-      missing << 'vm_id' unless @vm_id
+      if @platform != Platform::OTHER
+        missing << 'zone' unless @zone
+        missing << 'vm_id' unless @vm_id
+      end
       return if missing.empty?
       raise Fluent::ConfigError,
             "Unable to obtain metadata parameters: #{missing.join(' ')}"
@@ -1144,12 +1174,11 @@ module Fluent
 
       # GKE container.
       when GKE_CONSTANTS[:resource_type]
-        raw_kube_env = fetch_gce_metadata('instance/attributes/kube-env')
-        kube_env = YAML.load(raw_kube_env)
         return {
           'instance_id' => @vm_id,
           'zone' => @zone,
-          'cluster_name' => cluster_name_from_kube_env(kube_env)
+          'cluster_name' =>
+            fetch_gce_metadata('instance/attributes/cluster-name')
         }
 
       # Cloud Dataproc.
@@ -1529,15 +1558,6 @@ module Fluent
         end
         nil
       end
-    end
-
-    def cluster_name_from_kube_env(kube_env)
-      return kube_env['CLUSTER_NAME'] if kube_env.key?('CLUSTER_NAME')
-      instance_prefix = kube_env['INSTANCE_PREFIX']
-      gke_name_match = /^gke-(.+)-[0-9a-f]{8}$/.match(instance_prefix)
-      return gke_name_match.captures[0] if gke_name_match &&
-                                           !gke_name_match.captures.empty?
-      instance_prefix
     end
 
     def time_or_nil(ts_secs, ts_nanos)
